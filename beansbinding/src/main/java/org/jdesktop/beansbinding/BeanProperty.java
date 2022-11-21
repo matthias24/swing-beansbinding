@@ -20,11 +20,18 @@
 
 package org.jdesktop.beansbinding;
 
+import java.awt.EventQueue;
 import java.beans.*;
 import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
 import java.lang.reflect.Modifier;
 import java.util.*;
+import java.util.concurrent.Callable;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+
 import org.jdesktop.observablecollections.ObservableMap;
 import org.jdesktop.observablecollections.ObservableMapListener;
 import static org.jdesktop.beansbinding.PropertyStateEvent.UNREADABLE;
@@ -134,11 +141,15 @@ import org.jdesktop.beansbinding.ext.BeanAdapterFactory;
  *
  * @author Shannon Hickey
  * @author Scott Violet
+ * @author Schulze Matthias
  */
 public final class BeanProperty<S, V> extends PropertyHelper<S, V> {
 
     private Property<S, ?> baseProperty;
     private final PropertyPath path;
+    /** Change automatically between event dispatching thread and worker thread. Default: false */
+    private final boolean changeThread;
+    
     private IdentityHashMap<S, SourceEntry> map = new IdentityHashMap<S, SourceEntry>();
     private static final Object NOREAD = new Object();
 
@@ -393,7 +404,7 @@ public final class BeanProperty<S, V> extends PropertyHelper<S, V> {
                 return;
             }
             
-            int index = getSourceIndex(pce.getSource());
+            final int index = getSourceIndex(pce.getSource());
             
             if (index == -1) {
                 throw new AssertionError();
@@ -401,7 +412,29 @@ public final class BeanProperty<S, V> extends PropertyHelper<S, V> {
             
             String propertyName = pce.getPropertyName();
             if (propertyName == null || path.get(index).equals(propertyName)) {
-                cachedValueChanged(index + 1);
+                // Maybee have to change thread.
+                if (changeThread) {
+                    // Already right thread.
+                    if (EventQueue.isDispatchThread()) {
+                        cachedValueChanged(index + 1);
+                    }
+                    // Change thread.
+                    else {
+                        try {
+                            EventQueue.invokeAndWait(new Runnable() {
+                                public void run() {
+                                    cachedValueChanged(index + 1);
+                                }
+                            });
+                        } catch (InvocationTargetException ex) {
+                            ex.printStackTrace();
+                        } catch (InterruptedException ex) {
+                            ex.printStackTrace();
+                        }
+                    }
+                } else {
+                    cachedValueChanged(index + 1);
+                }
             }
         }
 
@@ -431,7 +464,7 @@ public final class BeanProperty<S, V> extends PropertyHelper<S, V> {
      *         no property names
      */
     public static final <S, V> BeanProperty<S, V> create(String path) {
-        return new BeanProperty<S, V>(null, path);
+        return new BeanProperty<S, V>(null, path, false);
     }
 
     /**
@@ -445,15 +478,49 @@ public final class BeanProperty<S, V> extends PropertyHelper<S, V> {
      *         no property names
      */
     public static final <S, V> BeanProperty<S, V> create(Property<S, ?> baseProperty, String path) {
-        return new BeanProperty<S, V>(baseProperty, path);
+        return new BeanProperty<S, V>(baseProperty, path, false);
     }
 
     /**
+     * Creates an instance of {@code BeanProperty} for the given path. Change
+     * automatically between event dispatching thread and worker thread.
+     *
+     * @param path the path
+     * @return an instance of {@code BeanProperty} for the given path
+     * @throws IllegalArgumentException if the path is null, or contains
+     *         no property names
+     */
+    public static final <S, V> BeanProperty<S, V> createChangeThread(String path) {
+        return new BeanProperty<S, V>(null, path, true);
+    }
+
+    /**
+     * Creates an instance of {@code BeanProperty} for the given base property
+     * and path. The path is relative to the value of the base property. Change
+     * automatically between event dispatching thread and worker thread.
+     *
+     * @param baseProperty the base property
+     * @param path the path
+     * @return an instance of {@code BeanProperty} for the given base property and path
+     * @throws IllegalArgumentException if the path is null, or contains
+     *         no property names
+     */
+    public static final <S, V> BeanProperty<S, V> createChangeThread(Property<S, ?> baseProperty, String path) {
+        return new BeanProperty<S, V>(baseProperty, path, true);
+    }
+
+    /**
+     * Creates an instance of {@code BeanProperty} for the given base property
+     * and path. The path is relative to the value of the base property.
+     * @param baseProperty the base property
+     * @param path the path
+     * @param changeThread Change automatically between event dispatching thread and worker thread.
      * @throws IllegalArgumentException for empty or {@code null} path.
      */
-    private BeanProperty(Property<S, ?> baseProperty, String path) {
+    private BeanProperty(Property<S, ?> baseProperty, String path, boolean changeThread) {
         this.path = PropertyPath.createPropertyPath(path);
         this.baseProperty = baseProperty;
+        this.changeThread= changeThread;
     }
 
     private Object getLastSource(S source) {
@@ -848,10 +915,12 @@ public final class BeanProperty<S, V> extends PropertyHelper<S, V> {
         return pd == null ? null : getPublicForm(object.getClass(), pd.getReadMethod());
     }
 
+    /** Thread-Pool für kurzlebige Threads. */
+    private final ExecutorService executor = Executors.newCachedThreadPool();
     /**
      * @throws PropertyResolutionException
      */
-    private Object read(Object reader, Object object, String string) {
+    private Object read(final Object reader, Object object, String string) {
         assert reader != null;
 
         if (reader instanceof Map) {
@@ -859,9 +928,36 @@ public final class BeanProperty<S, V> extends PropertyHelper<S, V> {
             return ((Map)reader).get(string);
         }
 
-        object = getAdapter(object, string);
+        final Object object2 = getAdapter(object, string);
         
-        return invokeMethod((Method)reader, object);
+        // Maybee have to change thread.
+        if (this.changeThread) {
+            // Already right thread.
+            if (!EventQueue.isDispatchThread()) {
+                return invokeMethod((Method)reader, object2);
+            }
+            // Change thread.
+            else {
+                Future<?> future = this.executor.submit(new Callable<Object>() {
+                    public Object call() throws Exception{
+                        return invokeMethod((Method)reader, object2);
+                    }
+                });
+                try {
+                    return future.get();
+                }
+                catch (InterruptedException ex) {
+                    ex.printStackTrace();
+                    return null;
+                }
+                catch (ExecutionException ex) {
+                    ex.printStackTrace();
+                    return null;
+                }
+            }
+        } else {
+            return invokeMethod((Method)reader, object2);
+        }
     }
 
     /**
@@ -919,7 +1015,7 @@ public final class BeanProperty<S, V> extends PropertyHelper<S, V> {
     /**
      * @throws PropertyResolutionException
      */
-    private void write(Object writer, Object object, String string, Object value) {
+    private void write(final Object writer, Object object, String string, final Object value) {
         assert writer != null;
 
         if (writer instanceof Map) {
@@ -928,9 +1024,33 @@ public final class BeanProperty<S, V> extends PropertyHelper<S, V> {
             return;
         }
 
-        object = getAdapter(object, string);
+        final Object object2 = getAdapter(object, string);
         
-        invokeMethod((Method)writer, object, value);
+        // Maybee have to change thread.
+        if (this.changeThread) {
+            // Already right thread.
+            if (EventQueue.isDispatchThread()) {
+                invokeMethod((Method)writer, object2, value);
+            }
+            // Change thread.
+            else {
+                try {
+                    EventQueue.invokeAndWait(new Runnable() {
+                        public void run() {
+                            invokeMethod((Method)writer, object2, value);
+                        }
+                    });
+                }
+                catch (InvocationTargetException ex) {
+                    ex.printStackTrace();
+                }
+                catch (InterruptedException ex) {
+                    ex.printStackTrace();
+                }
+            }
+        } else {
+            invokeMethod((Method)writer, object2, value);
+        }
     }
 
     /**
